@@ -157,7 +157,6 @@ def get_results_embed(results, sort_key='coins_per_point', reverse=True):
         color=discord.Color.blue()
     )
 
-    # Dictionary mapping item_id to custom emoji string
     EMOJI_MAPPING = {
         "BINGO_DISPLAY": "<:bingodisplay:1402041904346038282>",
         "COLLECTION_DISPLAY": "<:collectiondisplay:1402041894783025262>",
@@ -179,7 +178,7 @@ def get_results_embed(results, sort_key='coins_per_point', reverse=True):
     for item in sorted_results:
         item_id = item['item_id']
         market_price = item['market_price']
-        emoji = EMOJI_MAPPING.get(item_id, "") # Get emoji, or an empty string if not found
+        emoji = EMOJI_MAPPING.get(item_id, "")
         
         if item['points_spent'] > 0:
             if market_price > 0:
@@ -209,7 +208,6 @@ def get_results_embed(results, sort_key='coins_per_point', reverse=True):
     return embed
 
 # --- Discord Bot Setup ---
-# Load the token from the .env file
 try:
     DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
     if DISCORD_TOKEN is None:
@@ -236,13 +234,91 @@ items_data = {
     "DITTO_SKIN": {"points": 100, "prerequisites": []}
 }
 
+# Define the view and dropdown for sorting
+class SortView(discord.ui.View):
+    def __init__(self, bot_instance, results, original_author):
+        super().__init__()
+        self.bot_instance = bot_instance
+        self.results = results
+        self.original_author = original_author
+        
+        self.add_item(SortDropdown(self.results))
+    
+    # This prevents anyone other than the original user from using the dropdown
+    async def interaction_check(self, interaction: discord.Interaction):
+        return interaction.user == self.original_author
+
+class SortDropdown(discord.ui.Select):
+    def __init__(self, results):
+        self.results = results
+        options = [
+            discord.SelectOption(label="Coins per Point (Highest to Lowest)", value="coins_per_point_desc"),
+            discord.SelectOption(label="Coins per Point (Lowest to Highest)", value="coins_per_point_asc"),
+            discord.SelectOption(label="Net Profit (Highest to Lowest)", value="net_profit_desc"),
+            discord.SelectOption(label="Net Profit (Lowest to Highest)", value="net_profit_asc")
+        ]
+        super().__init__(placeholder="Choose a sorting option...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        sort_key, reverse_order = 'coins_per_point', True
+        
+        if self.values[0] == "coins_per_point_desc":
+            sort_key, reverse_order = 'coins_per_point', True
+        elif self.values[0] == "coins_per_point_asc":
+            sort_key, reverse_order = 'coins_per_point', False
+        elif self.values[0] == "net_profit_desc":
+            sort_key, reverse_order = 'net_profit', True
+        elif self.values[0] == "net_profit_asc":
+            sort_key, reverse_order = 'net_profit', False
+
+        new_embed = get_results_embed(self.results, sort_key=sort_key, reverse=reverse_order)
+        await interaction.response.edit_message(embed=new_embed)
+
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 results_cache = None
-message_cache = None
+
+async def bingo_logic(ctx_or_interaction, is_slash_command=False):
+    global results_cache
+
+    try:
+        if is_slash_command:
+            await ctx_or_interaction.response.send_message("Fetching the latest market data...", ephemeral=True)
+            send_func = ctx_or_interaction.followup.send
+        else:
+            send_func = ctx_or_interaction.send
+            await send_func("Fetching the latest market data...")
+
+        market_prices = fetch_market_prices()
+        
+        if not market_prices:
+            await send_func("Failed to fetch market data. Please try again later.")
+            return
+
+        results_cache = calculate_all_results(items_data, market_prices)
+        
+        initial_embed = get_results_embed(results_cache, sort_key='coins_per_point', reverse=True)
+        view = SortView(bot, results_cache, ctx_or_interaction.user if is_slash_command else ctx_or_interaction.author)
+        await send_func(embed=initial_embed, view=view)
+
+    except Exception as e:
+        print(f"An error occurred in the bingo command: {e}")
+        await send_func("An unexpected error occurred. Please contact an administrator.")
+
+
+@bot.command(name="bingo", help="Checks the profitability of Bingo items and refreshes data.")
+async def bingo_command(ctx):
+    await bingo_logic(ctx, is_slash_command=False)
+
+
+@bot.tree.command(name="bingo", description="Checks the profitability of Bingo items and refreshes data.")
+async def bingo_slash_command(interaction: discord.Interaction):
+    await bingo_logic(interaction, is_slash_command=True)
+
 
 @bot.event
 async def on_ready():
@@ -250,57 +326,12 @@ async def on_ready():
     print(f"Bot ID: {bot.user.id}")
     await bot.change_presence(activity=discord.Game(name="Bingo Price Checker"))
     print("Ready to check prices!")
-
-@bot.command(name="bingo", help="Checks the profitability of Bingo items and refreshes data.")
-async def bingo_command(ctx):
-    global results_cache, message_cache
-
-    try:
-        await ctx.send("Fetching the latest market data...")
-        market_prices = fetch_market_prices()
-        
-        if not market_prices:
-            await ctx.send("Failed to fetch market data. Please try again later.")
-            return
-
-        results_cache = calculate_all_results(items_data, market_prices)
-        
-        # Default sort: coins_per_point, highest to lowest
-        initial_embed = get_results_embed(results_cache, sort_key='coins_per_point', reverse=True)
-        message_cache = await ctx.send(embed=initial_embed)
-
-        # Add reaction emojis for sorting options
-        await message_cache.add_reaction('1️⃣')  # Coins per point (High to Low)
-        await message_cache.add_reaction('2️⃣')  # Coins per point (Low to High)
-        await message_cache.add_reaction('3️⃣')  # Net profit (High to Low)
-        await message_cache.add_reaction('4️⃣')  # Net profit (Low to High)
-
-    except Exception as e:
-        print(f"An error occurred in the bingo command: {e}")
-        await ctx.send("An unexpected error occurred. Please contact an administrator.")
-
-@bot.event
-async def on_reaction_add(reaction, user):
-    if user.bot or reaction.message.id != message_cache.id:
-        return
-
-    sort_key, reverse_order = 'coins_per_point', True
     
-    if reaction.emoji == '1️⃣':
-        sort_key, reverse_order = 'coins_per_point', True
-    elif reaction.emoji == '2️⃣':
-        sort_key, reverse_order = 'coins_per_point', False
-    elif reaction.emoji == '3️⃣':
-        sort_key, reverse_order = 'net_profit', True
-    elif reaction.emoji == '4️⃣':
-        sort_key, reverse_order = 'net_profit', False
-    else:
-        # Ignore other reactions
-        return
-
-    new_embed = get_results_embed(results_cache, sort_key=sort_key, reverse=reverse_order)
-    await reaction.message.edit(embed=new_embed)
-    await reaction.remove(user)
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s).")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
 
 # Run the bot with your token
 bot.run(os.getenv("DISCORD_TOKEN"))
