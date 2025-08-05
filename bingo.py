@@ -6,6 +6,7 @@ from discord.ext import commands
 import os
 from dotenv import load_dotenv
 import sys
+import concurrent.futures
 
 # Load environment variables from .env file
 load_dotenv()
@@ -62,11 +63,11 @@ def fetch_market_prices():
         "DITTO_SKIN": "DITTO_SKIN",
         "BINGO_BLUE_DYE": "DYE_BINGO_BLUE",
     }
-
-    print("Fetching lowest BIN prices from CoflNet API...")
     
-    for item_id, item_tag in item_tags_to_fetch.items():
-        market_prices[item_id] = {'lbin_price': 0, 'last_week_lbin': 0, 'last_week_avg': 0, 'last_month_lbin': 0, 'last_month_avg': 0}
+    print("Fetching lowest BIN prices from CoflNet API concurrently...")
+    
+    def fetch_item_data(item_id, item_tag):
+        price_data = {'lbin_price': 0, 'last_week_lbin': 0, 'last_week_avg': 0, 'last_month_lbin': 0, 'last_month_avg': 0}
         
         try:
             url_active_bin = f"{base_url}/{item_tag}/active/bin"
@@ -76,10 +77,8 @@ def fetch_market_prices():
             
             if data and isinstance(data, list) and 'startingBid' in data[0]:
                 lowest_price = data[0]['startingBid']
-                market_prices[item_id]['lbin_price'] = lowest_price / 1_000_000
-                print(f"  - Found active BIN for {item_id} (tag: {item_tag}). Price: {format_price(market_prices[item_id]['lbin_price'])} coins")
+                price_data['lbin_price'] = lowest_price / 1_000_000
             else:
-                print(f"  - No active BIN auction found for {item_id}. Checking last week's sales...")
                 url_sold_week = f"{base_url}/{item_tag}/sold"
                 response_week = requests.get(url_sold_week, timeout=5)
                 response_week.raise_for_status()
@@ -90,11 +89,9 @@ def fetch_market_prices():
                     if prices_week:
                         last_week_lbin = min(prices_week) / 1_000_000
                         last_week_avg = (sum(prices_week) / len(prices_week)) / 1_000_000
-                        market_prices[item_id]['last_week_lbin'] = last_week_lbin
-                        market_prices[item_id]['last_week_avg'] = last_week_avg
-                        print(f"    - Found last week's sales. Lowest: {format_price(last_week_lbin)}, Average: {format_price(last_week_avg)}")
+                        price_data['last_week_lbin'] = last_week_lbin
+                        price_data['last_week_avg'] = last_week_avg
                     else:
-                        print("    - No BIN sales found in the last week. Checking last month's sales...")
                         url_sold_month = f"{base_url}/{item_tag}/sold?page=last&count=1000"
                         response_month = requests.get(url_sold_month, timeout=5)
                         response_month.raise_for_status()
@@ -105,25 +102,25 @@ def fetch_market_prices():
                             if prices_month:
                                 last_month_lbin = min(prices_month) / 1_000_000
                                 last_month_avg = (sum(prices_month) / len(prices_month)) / 1_000_000
-                                market_prices[item_id]['last_month_lbin'] = last_month_lbin
-                                market_prices[item_id]['last_month_avg'] = last_month_avg
-                                print(f"    - Found last month's sales. Lowest: {format_price(last_month_lbin)}, Average: {format_price(last_month_avg)}")
-                            else:
-                                print("    - No BIN sales found in the last month.")
-                        else:
-                            print("    - No sales data found for the last month.")
-                else:
-                    print("    - No sales data found for the last week.")
-        except HTTPError as e:
-            if e.response.status_code == 400:
-                print(f"Error fetching data for {item_id} (tag: {item_tag}): {e.response.status_code} - Bad Request.")
-            else:
-                print(f"Error fetching data for {item_id}: {e}")
-        except RequestException as e:
+                                price_data['last_month_lbin'] = last_month_lbin
+                                price_data['last_month_avg'] = last_month_avg
+        except Exception as e:
             print(f"Error fetching data for {item_id}: {e}")
+        
+        return item_id, price_data
 
-    print("Market data fetched successfully.")
+    # Use a thread pool to fetch data for all items concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=13) as executor:
+        future_to_item = {
+            executor.submit(fetch_item_data, item_id, item_tag): item_id 
+            for item_id, item_tag in item_tags_to_fetch.items()
+        }
+        for future in concurrent.futures.as_completed(future_to_item):
+            item_id, price_data = future.result()
+            market_prices[item_id] = price_data
+
     return market_prices
+
 
 def calculate_all_results(items_data, market_prices):
     results = []
@@ -286,8 +283,9 @@ async def bingo_logic(ctx_or_interaction, is_slash_command=False):
     global results_cache
 
     try:
+        # Acknowledge slash command to prevent timeout
         if is_slash_command:
-            await ctx_or_interaction.response.send_message("Fetching the latest market data...", ephemeral=True)
+            await ctx_or_interaction.response.defer()
             send_func = ctx_or_interaction.followup.send
         else:
             send_func = ctx_or_interaction.send
@@ -333,5 +331,5 @@ async def on_ready():
     except Exception as e:
         print(f"Failed to sync slash commands: {e}")
 
-# Run the bot with your token
+# Run the bot with token
 bot.run(os.getenv("DISCORD_TOKEN"))
